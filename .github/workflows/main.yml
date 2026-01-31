@@ -327,17 +327,65 @@ jobs:
            security list-keychains -s tla
            ## Not sure what this is for, but hey: https://stackoverflow.com/a/40039594
            security set-key-partition-list -S apple-tool:,apple: -s -k ${{ secrets.APPLE_CERT_PASSWORD }} tla
-           ## Unzip, sign, and zip up the TLA Toolbox.
+           ## === Sign x86_64 ===
            unzip toolbox/org.lamport.tla.toolbox.product.product/target/products/${{ matrix.TOOLBOX_PRODUCT_ZIP }}
-           codesign --force --identifier org.lamport.tla.toolbox.product.product --keychain tla --deep --display --entitlements toolbox/org.lamport.tla.toolbox.product.product/entitlements.plist --options runtime --verbose=4 -h -f -s "Developer ID Application: M K (3PCM4M3RWK)" "TLA+ Toolbox.app"
+           codesign --force --identifier org.lamport.tla.toolbox.product.product --keychain tla --deep --display --entitlements toolbox/org.lamport.tla.toolbox.product.product/entitlements.plist --options runtime --verbose=4 -h -f -s "Developer ID Application: Hao Dong (UYJPJLQSRD)" "TLA+ Toolbox.app"
            ditto -ck --sequesterRsrc --keepParent "TLA+ Toolbox.app" ${{ matrix.TOOLBOX_PRODUCT_ZIP }}
-           #xcrun altool --notarize-app --primary-bundle-id "org.lamport.tla.toolbox.product.product" --username "${{secrets.APPLE_CODESIGN_DEVELOPER_ID}}" --password "${{secrets.APPLE_CODESIGN_DEVELOPER_PASSWORD}}" --file "${{ matrix.TOOLBOX_PRODUCT_ZIP }}"
-           xcrun notarytool submit --wait --team-id "${{secrets.APPLE_CODESIGN_TEAM_ID}}" --apple-id "${{secrets.APPLE_CODESIGN_DEVELOPER_ID}}" --password "${{secrets.APPLE_CODESIGN_DEVELOPER_PASSWORD}}" "${{ matrix.TOOLBOX_PRODUCT_ZIP }}"
-           ## Upload signed TLAToolbox zip to Github release.
+           
+           ## === Sign ARM64 ===
+           rm -rf "TLA+ Toolbox.app"
+           unzip toolbox/org.lamport.tla.toolbox.product.product/target/products/${{matrix.TOOLBOX_PRODUCT_ZIP_ARM64}}
+           codesign --force --identifier org.lamport.tla.toolbox.product.product --keychain tla --deep --display --entitlements toolbox/org.lamport.tla.toolbox.product.product/entitlements.plist --options runtime --verbose=4 -h -f -s "Developer ID Application: Hao Dong (UYJPJLQSRD)" "TLA+ Toolbox.app"
+           ditto -ck --sequesterRsrc --keepParent "TLA+ Toolbox.app" ${{matrix.TOOLBOX_PRODUCT_ZIP_ARM64}}
+           
+           ## === Submit both notarizations in parallel (no --wait) ===
+           echo "Submitting x86_64 for notarization..."
+           NOTARY_X86=$(xcrun notarytool submit --team-id "${{secrets.APPLE_CODESIGN_TEAM_ID}}" --apple-id "${{secrets.APPLE_CODESIGN_DEVELOPER_ID}}" --password "${{secrets.APPLE_CODESIGN_DEVELOPER_PASSWORD}}" --output-format json "${{ matrix.TOOLBOX_PRODUCT_ZIP }}")
+           SUB_X86=$(echo "$NOTARY_X86" | jq -r '.id')
+           echo "x86_64 submission ID: $SUB_X86"
+           
+           echo "Submitting ARM64 for notarization..."
+           NOTARY_ARM=$(xcrun notarytool submit --team-id "${{secrets.APPLE_CODESIGN_TEAM_ID}}" --apple-id "${{secrets.APPLE_CODESIGN_DEVELOPER_ID}}" --password "${{secrets.APPLE_CODESIGN_DEVELOPER_PASSWORD}}" --output-format json "${{matrix.TOOLBOX_PRODUCT_ZIP_ARM64}}")
+           SUB_ARM=$(echo "$NOTARY_ARM" | jq -r '.id')
+           echo "ARM64 submission ID: $SUB_ARM"
+           
+           ## === Poll both notarizations until complete ===
+           echo "Waiting for both notarizations to complete..."
+           while true; do
+             STATUS_X86=$(xcrun notarytool info "$SUB_X86" --team-id "${{secrets.APPLE_CODESIGN_TEAM_ID}}" --apple-id "${{secrets.APPLE_CODESIGN_DEVELOPER_ID}}" --password "${{secrets.APPLE_CODESIGN_DEVELOPER_PASSWORD}}" --output-format json | jq -r '.status')
+             STATUS_ARM=$(xcrun notarytool info "$SUB_ARM" --team-id "${{secrets.APPLE_CODESIGN_TEAM_ID}}" --apple-id "${{secrets.APPLE_CODESIGN_DEVELOPER_ID}}" --password "${{secrets.APPLE_CODESIGN_DEVELOPER_PASSWORD}}" --output-format json | jq -r '.status')
+             echo "$(date): x86_64=$STATUS_X86, ARM64=$STATUS_ARM"
+             
+             if [[ "$STATUS_X86" == "Invalid" ]]; then
+               echo "x86_64 notarization failed!"
+               xcrun notarytool log "$SUB_X86" --team-id "${{secrets.APPLE_CODESIGN_TEAM_ID}}" --apple-id "${{secrets.APPLE_CODESIGN_DEVELOPER_ID}}" --password "${{secrets.APPLE_CODESIGN_DEVELOPER_PASSWORD}}"
+               exit 1
+             fi
+             if [[ "$STATUS_ARM" == "Invalid" ]]; then
+               echo "ARM64 notarization failed!"
+               xcrun notarytool log "$SUB_ARM" --team-id "${{secrets.APPLE_CODESIGN_TEAM_ID}}" --apple-id "${{secrets.APPLE_CODESIGN_DEVELOPER_ID}}" --password "${{secrets.APPLE_CODESIGN_DEVELOPER_PASSWORD}}"
+               exit 1
+             fi
+             
+             if [[ "$STATUS_X86" == "Accepted" && "$STATUS_ARM" == "Accepted" ]]; then
+               echo "Both notarizations completed successfully!"
+               break
+             fi
+             
+             sleep 30
+           done
+           
+           ## === Upload both signed zips to Github release ===
            DRAFT_RELEASE=$(curl -sS -H "Authorization: token ${{secrets.GITHUB_TOKEN}}" https://api.github.com/repos/${{ github.repository }}/releases --header "Content-Type: application/json" | jq '.[]| select(.name=="${{ matrix.GITHUB_RELEASE_NAME }}") | .id')
+           
            ID=$(curl -sS -H "Authorization: token ${{secrets.GITHUB_TOKEN}}" https://api.github.com/repos/${{ github.repository }}/releases/$DRAFT_RELEASE/assets --header "Content-Type: application/json"  | jq '.[]| select(.name == "${{ matrix.TOOLBOX_PRODUCT_ZIP }}") | .id')
            curl -sS -X DELETE -H "Authorization: token ${{secrets.GITHUB_TOKEN}}" https://api.github.com/repos/${{ github.repository }}/releases/assets/$ID
            curl -s -X POST -H "Content-Type: application/zip" -H "Authorization: token ${{secrets.GITHUB_TOKEN}}" https://uploads.github.com/repos/${{ github.repository }}/releases/$DRAFT_RELEASE/assets?name=${{ matrix.TOOLBOX_PRODUCT_ZIP }} --upload-file ${{ matrix.TOOLBOX_PRODUCT_ZIP }}
-           ## Upload p2 and apt repository to INRIA machine.
+           
+           ID=$(curl -sS -H "Authorization: token ${{secrets.GITHUB_TOKEN}}" https://api.github.com/repos/${{ github.repository }}/releases/$DRAFT_RELEASE/assets --header "Content-Type: application/json"  | jq '.[]| select(.name == "${{matrix.TOOLBOX_PRODUCT_ZIP_ARM64}}") | .id')
+           curl -sS -X DELETE -H "Authorization: token ${{secrets.GITHUB_TOKEN}}" https://api.github.com/repos/${{ github.repository }}/releases/assets/$ID
+           curl -s -X POST -H "Content-Type: application/zip" -H "Authorization: token ${{secrets.GITHUB_TOKEN}}" https://uploads.github.com/repos/${{ github.repository }}/releases/$DRAFT_RELEASE/assets?name=${{matrix.TOOLBOX_PRODUCT_ZIP_ARM64}} --upload-file ${{matrix.TOOLBOX_PRODUCT_ZIP_ARM64}}
+           
+           ## === Upload both zips to INRIA machine ===
            rsync --version
-           rsync -e "ssh -o StrictHostKeyChecking=no -i ~/.ssh/id_rsa" --delete -av ${{ matrix.TOOLBOX_PRODUCT_ZIP }} github@upload.tlapl.us:products/
+           rsync -e "ssh -o StrictHostKeyChecking=no -i ~/.ssh/id_rsa" --delete -av ${{ matrix.TOOLBOX_PRODUCT_ZIP }} ${{ matrix.TOOLBOX_PRODUCT_ZIP_ARM64 }} github@upload.tlapl.us:products/
