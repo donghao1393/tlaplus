@@ -1,0 +1,122 @@
+name: Test Parallel Notarization
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - fix/parallel-notarization
+
+jobs:
+  test-macos-signing:
+    runs-on: macos-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up JDK 17
+      uses: actions/setup-java@v4
+      with:
+        java-version: 17
+        distribution: temurin
+
+    - name: Build minimal test app
+      run: |
+        mkdir -p "Test.app/Contents/MacOS"
+        echo '#!/bin/bash' > "Test.app/Contents/MacOS/test"
+        echo 'echo Hello' >> "Test.app/Contents/MacOS/test"
+        chmod +x "Test.app/Contents/MacOS/test"
+        cat > "Test.app/Contents/Info.plist" << 'PLIST'
+        <?xml version="1.0" encoding="UTF-8"?>
+        <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+        <plist version="1.0">
+        <dict>
+          <key>CFBundleExecutable</key>
+          <string>test</string>
+          <key>CFBundleIdentifier</key>
+          <string>com.test.notarization</string>
+          <key>CFBundleName</key>
+          <string>Test</string>
+          <key>CFBundleVersion</key>
+          <string>1.0</string>
+          <key>CFBundleShortVersionString</key>
+          <string>1.0</string>
+        </dict>
+        </plist>
+        PLIST
+
+    - name: Set up Apple Certs
+      run: 'echo "$APPLE_CODESIGN_CERTS" > certs.pem'
+      env:
+        APPLE_CODESIGN_CERTS: ${{ secrets.APPLE_CODESIGN_CERTS }}
+
+    - name: Set up Apple Key
+      run: 'echo "$APPLE_CODESIGN_DEVELOPER_PRIVKEY" > dev.pem'
+      env:
+        APPLE_CODESIGN_DEVELOPER_PRIVKEY: ${{ secrets.APPLE_CODESIGN_DEVELOPER_PRIVKEY }}
+
+    - name: Create keychain and sign apps
+      run: |
+        openssl pkcs12 -export -inkey dev.pem -in certs.pem -out dev.p12 -passin pass:${{ secrets.APPLE_CERT_PASSWORD }} -passout pass:${{ secrets.APPLE_CERT_PASSWORD }}
+        
+        security create-keychain -p ${{ secrets.APPLE_CERT_PASSWORD }} tla
+        security import certs.pem -k tla -P ${{ secrets.APPLE_CERT_PASSWORD }} -T /usr/bin/codesign
+        security import dev.p12 -k tla -P ${{ secrets.APPLE_CERT_PASSWORD }} -T /usr/bin/codesign
+        security list-keychains -s tla
+        security set-key-partition-list -S apple-tool:,apple: -s -k ${{ secrets.APPLE_CERT_PASSWORD }} tla
+        
+        cp -R "Test.app" "Test-x86.app"
+        cp -R "Test.app" "Test-arm.app"
+        
+        codesign --force --identifier com.test.notarization --keychain tla --options runtime -s "Developer ID Application: Hao Dong (UYJPJLQSRD)" "Test-x86.app"
+        codesign --force --identifier com.test.notarization --keychain tla --options runtime -s "Developer ID Application: Hao Dong (UYJPJLQSRD)" "Test-arm.app"
+        
+        ditto -ck --keepParent "Test-x86.app" test-x86.zip
+        ditto -ck --keepParent "Test-arm.app" test-arm.zip
+        
+        echo "Created test-x86.zip and test-arm.zip"
+        ls -la *.zip
+
+    - name: Parallel notarization test
+      run: |
+        echo "=== Submitting both notarizations in parallel ==="
+        
+        echo "Submitting x86 for notarization..."
+        NOTARY_X86=$(xcrun notarytool submit --team-id "${{secrets.APPLE_CODESIGN_TEAM_ID}}" --apple-id "${{secrets.APPLE_CODESIGN_DEVELOPER_ID}}" --password "${{secrets.APPLE_CODESIGN_DEVELOPER_PASSWORD}}" --output-format json "test-x86.zip")
+        SUB_X86=$(echo "$NOTARY_X86" | jq -r '.id')
+        echo "x86 submission ID: $SUB_X86"
+        
+        echo "Submitting ARM for notarization..."
+        NOTARY_ARM=$(xcrun notarytool submit --team-id "${{secrets.APPLE_CODESIGN_TEAM_ID}}" --apple-id "${{secrets.APPLE_CODESIGN_DEVELOPER_ID}}" --password "${{secrets.APPLE_CODESIGN_DEVELOPER_PASSWORD}}" --output-format json "test-arm.zip")
+        SUB_ARM=$(echo "$NOTARY_ARM" | jq -r '.id')
+        echo "ARM submission ID: $SUB_ARM"
+        
+        echo "=== Polling both notarizations ==="
+        START_TIME=$(date +%s)
+        
+        while true; do
+          STATUS_X86=$(xcrun notarytool info "$SUB_X86" --team-id "${{secrets.APPLE_CODESIGN_TEAM_ID}}" --apple-id "${{secrets.APPLE_CODESIGN_DEVELOPER_ID}}" --password "${{secrets.APPLE_CODESIGN_DEVELOPER_PASSWORD}}" --output-format json | jq -r '.status')
+          STATUS_ARM=$(xcrun notarytool info "$SUB_ARM" --team-id "${{secrets.APPLE_CODESIGN_TEAM_ID}}" --apple-id "${{secrets.APPLE_CODESIGN_DEVELOPER_ID}}" --password "${{secrets.APPLE_CODESIGN_DEVELOPER_PASSWORD}}" --output-format json | jq -r '.status')
+          
+          ELAPSED=$(($(date +%s) - START_TIME))
+          echo "$(date): x86=$STATUS_X86, ARM=$STATUS_ARM (elapsed: ${ELAPSED}s)"
+          
+          if [[ "$STATUS_X86" == "Invalid" ]]; then
+            echo "x86 notarization failed!"
+            xcrun notarytool log "$SUB_X86" --team-id "${{secrets.APPLE_CODESIGN_TEAM_ID}}" --apple-id "${{secrets.APPLE_CODESIGN_DEVELOPER_ID}}" --password "${{secrets.APPLE_CODESIGN_DEVELOPER_PASSWORD}}"
+            exit 1
+          fi
+          if [[ "$STATUS_ARM" == "Invalid" ]]; then
+            echo "ARM notarization failed!"
+            xcrun notarytool log "$SUB_ARM" --team-id "${{secrets.APPLE_CODESIGN_TEAM_ID}}" --apple-id "${{secrets.APPLE_CODESIGN_DEVELOPER_ID}}" --password "${{secrets.APPLE_CODESIGN_DEVELOPER_PASSWORD}}"
+            exit 1
+          fi
+          
+          if [[ "$STATUS_X86" == "Accepted" && "$STATUS_ARM" == "Accepted" ]]; then
+            END_TIME=$(date +%s)
+            TOTAL=$((END_TIME - START_TIME))
+            echo "=== Both notarizations completed successfully! ==="
+            echo "Total parallel wait time: ${TOTAL} seconds"
+            break
+          fi
+          
+          sleep 30
+        done
